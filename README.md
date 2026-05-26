@@ -194,8 +194,6 @@ graph TB
 | macOS launchd      | 일간·주간 데이터 수집 / 데몬 유지 | Slack bot이 죽어도 OS 레벨에서 무조건 실행되어야 하는 백본 |
 | Claude App Routine | 일간·주간 LLM 분석 트리거       | 종량제 토큰 비용 없이 구독료 안에서 매일 Opus 분석 운영    |
 
-> 주간 분석은 초기에 `node-cron`(Node 프로세스 내 스케줄러)으로 돌렸으나, LLM 호출을 Anthropic API 직접 호출에서 Claude 앱 Routine으로 일원화하면서 cron 라인은 제거했다. 지금은 일간·주간 모두 동일한 흐름(launchd 데이터 추출 → Routine 분석 → CLI Slack 송신)으로 돌아간다.
-
 **SQLite WAL + 다층 백업**
 
 운영 데이터 손실은 1인 운영의 약점이라 백업 전략을 따로 설계했다.
