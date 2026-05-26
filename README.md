@@ -123,14 +123,15 @@ sequenceDiagram
 
 ### 3. 영속 세션 + 자체 추이 누적
 
-시스템은 **일일 리포트**와 **주간 리포트** 두 가지를 자동으로 생성하며, 각 작업의 성격에 맞춰 스케줄러를 따로 두고 운영한다.
+시스템은 **일일 리포트**와 **주간 리포트** 두 가지를 자동으로 생성하며, 각각 **데이터 수집 → LLM 분석 → Slack 송신** 흐름을 동일하게 따른다. 수집 레이어(launchd)와 분석 레이어(Claude App Routine)는 별도 스케줄러로 분리해, 한쪽 장애가 다른 레이어를 정지시키지 않게 했다.
 
 ```mermaid
 graph TB
-    subgraph Schedulers["스케줄러 (작업별 분리)"]
-        L["macOS launchd<br/>매일 08:50<br/>· 데이터 수집"]
+    subgraph Schedulers["스케줄러 (수집 + 분석 분리)"]
+        L["macOS launchd<br/>매일 08:50<br/>· 일간 데이터 수집"]
         R["Claude App Routine<br/>매일 09:00<br/>· 일일 리포트"]
-        C["node-cron<br/>월요일 09:00<br/>· 주간 리포트"]
+        LW["macOS launchd<br/>월요일 09:15<br/>· 주간 데이터 추출"]
+        RW["Claude App Routine<br/>월요일 09:30<br/>· 주간 리포트"]
     end
 
     subgraph Core["코어 시스템"]
@@ -149,8 +150,9 @@ graph TB
 
     L -->|수집 트리거| DM
     DM -->|60가지 이상 데이터| DB
-    R -->|데이터 + 7일 메모 + 일지| O
-    C -->|7일치 데이터 집계| O
+    R -->|어제 데이터 + 7일 메모 + 일지| O
+    LW -->|7일치 데이터 추출| DB
+    RW -->|주간 컨텍스트 + 전주 비교| O
     O -->|일일/주간 리포트| OUT
     IN -.->|operational_context| DB
     DB -.->|Fast Path 정규식| OUT
@@ -159,7 +161,7 @@ graph TB
     classDef core fill:#f5f5f5,stroke:#424242
     classDef llm fill:#fff3e0,stroke:#f57c00
     classDef slack fill:#f3e5f5,stroke:#7b1fa2
-    class L,R,C sched
+    class L,R,LW,RW sched
     class DM,DB core
     class O llm
     class IN,OUT slack
@@ -185,13 +187,14 @@ graph TB
 
 **작업 라이프사이클별 스케줄러 분리**
 
-스케줄러를 하나로 통일하지 않고 작업 성격에 맞춰 분리. 한쪽 장애가 다른 작업까지 정지시키지 않도록 작업별로 격리했다.
+스케줄러를 하나로 통일하지 않고 **데이터 수집 ↔ LLM 분석** 두 레이어로 분리. 한쪽 장애가 다른 작업까지 정지시키지 않도록 격리했다.
 
-| Scheduler          | 사용처                       | 분리 이유                                                  |
-| ------------------ | ---------------------------- | ---------------------------------------------------------- |
-| macOS launchd      | 데이터 수집·데몬 상시 유지   | Slack bot이 죽어도 OS 레벨에서 무조건 실행되어야 하는 백본 |
-| Claude App Routine | 일일 LLM 분석 트리거         | LLM 분석은 외부 작업, 앱 단위 스케줄                       |
-| node-cron          | 주간 리포트                  | Slack bot 활성 상태에서만 의미 있는 작업                   |
+| Scheduler          | 사용처                          | 분리 이유                                                  |
+| ------------------ | ------------------------------- | ---------------------------------------------------------- |
+| macOS launchd      | 일간·주간 데이터 수집 / 데몬 유지 | Slack bot이 죽어도 OS 레벨에서 무조건 실행되어야 하는 백본 |
+| Claude App Routine | 일간·주간 LLM 분석 트리거       | 종량제 토큰 비용 없이 구독료 안에서 매일 Opus 분석 운영    |
+
+> 주간 분석은 초기에 `node-cron`(Node 프로세스 내 스케줄러)으로 돌렸으나, LLM 호출을 Anthropic API 직접 호출에서 Claude 앱 Routine으로 일원화하면서 cron 라인은 제거했다. 지금은 일간·주간 모두 동일한 흐름(launchd 데이터 추출 → Routine 분석 → CLI Slack 송신)으로 돌아간다.
 
 **SQLite WAL + 다층 백업**
 
@@ -209,7 +212,7 @@ graph TB
 
 **Claude 앱 Routine으로 호출 — 종량제 비용 회피**
 
-LLM 호출은 Anthropic API 직접 호출이 아니라 구독 중인 Claude 앱의 **Scheduled Task(Routines)** 기능으로 처리한다. 매일 정해진 시간에 Routine이 입력 파일을 읽고 Opus 4.7에게 분석을 요청하는 방식 — 종량제 토큰 비용 없이 구독료 안에서 일일 고품질 분석을 운영할 수 있다. 분석 입력 파일도 매일 동일 경로로 갱신되어 같은 Routine이 그대로 재실행된다.
+LLM 호출은 Anthropic API 직접 호출이 아니라 구독 중인 Claude 앱의 **Scheduled Task(Routines)** 기능으로 처리한다. 일간·주간 각각 정해진 시간에 Routine이 자기 입력 파일(`briefing-data.txt` / `briefing-data-weekly.txt`)을 읽고 Opus 4.7에게 분석을 요청하는 방식 — 종량제 토큰 비용 없이 구독료 안에서 일일·주간 고품질 분석을 모두 운영할 수 있다. 입력 파일은 동일 경로로 매일/매주 덮어쓰기되어 같은 Routine이 그대로 재실행된다.
 
 **Fast Path — 정규식 → DB**
 
@@ -265,7 +268,7 @@ AI를 코딩 보조가 아니라 협업 개발자로 취급하고, **시스템 �
 | Messaging  | Slack Bolt (Socket Mode + Block Kit)                          |
 | Database   | SQLite (better-sqlite3, WAL mode)                             |
 | Browser    | Playwright (CDP, persistent context, storageState 영속화)     |
-| Schedulers | macOS launchd · Claude App Routine · node-cron                |
+| Schedulers | macOS launchd · Claude App Routine                            |
 | AI 개발    | Claude Code — Custom Skills · Hooks · ADR 워크플로우          |
 
 ### 주요 기술 선택 근거
