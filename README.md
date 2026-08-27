@@ -95,7 +95,7 @@ sequenceDiagram
     participant LLM as Opus 4.7
 
     LD->>SC: auto-collect.sh
-    SC->>SC: connectOverCDP (재사용 세션)
+    SC->>SC: 저장된 세션 주입 (로그인 생략)
     SC->>DB: 15페이지 / 60+ 메트릭 저장
 
     SL-->>DB: 사업자 메모 (operational_context)
@@ -107,7 +107,7 @@ sequenceDiagram
     CR->>SL: #스토어-매니저 자동 전송 (~09:15)
 ```
 
-1. **데이터 수집** — `launchd` 트리거 → `auto-collect.sh` → Playwright CDP 데몬에 `connectOverCDP`로 연결해 세션 재사용 → 스크래핑 → SQLite 저장
+1. **데이터 수집** — `launchd` 트리거 → `auto-collect.sh` → 저장해 둔 세션을 headless 브라우저에 주입해 로그인 생략 → 스크래핑 → SQLite 저장
 2. **메모 컨텍스트 통합** — `operational_context` 테이블에서 7일 윈도우 조회 → daily-report-input.md에 자동 통합
 3. **LLM 분석** — Claude 앱 `store-morning-briefing` Routine이 입력 파일을 읽고 Opus 4.7에게 분석 요청 → 60+ 메트릭 + 어제 대비 변화율 + 7일 메모 종합 → 7섹션 리포트 생성
 4. **자동 발송** — `post-daily-report` 스크립트가 Slack `#스토어-매니저` 채널로 자동 전송
@@ -121,7 +121,7 @@ sequenceDiagram
 
 ---
 
-### 3. 영속 세션 + 자체 추이 누적
+### 3. 세션 재사용 + 자체 추이 누적
 
 시스템은 **일일 리포트**와 **주간 리포트** 두 가지를 자동으로 생성하며, 각각 **데이터 수집 → LLM 분석 → Slack 송신** 흐름을 동일하게 따른다. 수집 레이어(launchd)와 분석 레이어(Claude App Routine)는 별도 스케줄러로 분리해, 한쪽 장애가 다른 레이어를 정지시키지 않게 했다.
 
@@ -135,7 +135,7 @@ graph TB
     end
 
     subgraph Core["코어 시스템"]
-        DM[Playwright CDP 데몬<br/>영속 세션]
+        DM["Playwright 스크래퍼<br/>세션 파일 재사용"]
         DB[(SQLite + WAL)]
     end
 
@@ -167,15 +167,14 @@ graph TB
     class IN,OUT slack
 ```
 
-**Playwright CDP 데몬 — 영속 세션 + 자동 복구**
+**세션 유지 — 로그인 1회로 한 달간 자동 수집**
 
-스마트스토어는 세션 만료가 잦다. 수동 로그인 1회만으로 매일 자동 수집을 살리려면 단순 `storageState` 저장만으로는 부족했다. **데몬 + CDP 재사용 + storageState 직접 사용** 결합으로 안정화하기까지 여러 차례 구조 조정. **안정화 이후 몇 주째 수동 개입 없이 자동 운영 중.**
+수집 스크립트는 매일 새 headless 브라우저를 띄우기 때문에 그대로 두면 매번 로그인 화면부터 시작한다. 수동 로그인 때 받은 `storageState`를 파일로 저장해 두고 실행할 때마다 주입하도록 만들어서, 로그인 한 번이면 한 달쯤 자동 수집이 이어진다. 인증 쿠키의 유효기간은 30일이지만 그 전에 네이버가 서버 쪽에서 세션을 끊기도 해서, 만료를 감지하고 알리는 경로를 따로 두었다.
 
-- **데몬이 세션 보유** — `launchPersistentContext(userDataDir)`로 데몬 1개가 브라우저를 상시 유지
-- **CDP 재사용** — 스크래퍼는 `connectOverCDP`로 데몬에 연결, 매 실행마다 로그인 생략
-- **storageState 직접 사용** — 데몬 재시작에도 로그인 상태 복원 (데몬 쿠키 추출 우회 결정)
-- **세션 만료 자동 복구** — 만료 감지 시 Slack 알림 + 재로그인 안내 → 1회 수동으로 다시 살림
-- **launchd가 데몬 상시 유지** — 데몬이 죽으면 OS 레벨에서 자동 재기동
+- **세션 파일 재사용** — 수집 스크립트가 실행될 때마다 저장된 `storageState`를 새 브라우저 컨텍스트에 주입해 로그인을 건너뛴다
+- **수집 성공 시 갱신** — 스마트스토어와 비즈어드바이저 양쪽 접근이 확인되면 그날 쿠키로 세션 파일을 다시 저장해 둔다
+- **만료 자동 복구 시도** — 로그인 화면으로 리다이렉트되면 간편 로그인 버튼을 먼저 눌러보고, 최대 25초 안에 통과하지 못하면 Slack으로 알린다
+- **수동 복구는 명령 한 줄** — 알림을 받으면 `pnpm login-naver`로 브라우저를 띄워 로그인 한 번만 하면 된다
 
 **데이터 수집 — 외부에 없는 추이를 자체 누적**
 
@@ -191,7 +190,7 @@ graph TB
 
 | Scheduler          | 사용처                          | 분리 이유                                                  |
 | ------------------ | ------------------------------- | ---------------------------------------------------------- |
-| macOS launchd      | 일간·주간 데이터 수집 / 데몬 유지 | Slack bot이 죽어도 OS 레벨에서 무조건 실행되어야 하는 백본 |
+| macOS launchd      | 일간·주간 데이터 수집           | Slack bot이 죽어도 OS 레벨에서 무조건 실행되어야 하는 백본 |
 | Claude App Routine | 일간·주간 LLM 분석 트리거       | 종량제 토큰 비용 없이 구독료 안에서 매일 Opus 분석 운영    |
 
 **SQLite WAL + 다층 백업**
@@ -265,7 +264,7 @@ AI를 코딩 보조가 아니라 협업 개발자로 취급하고, **시스템 �
 | Runtime    | Node.js 22 + TypeScript (ESM)                                 |
 | Messaging  | Slack Bolt (Socket Mode + Block Kit)                          |
 | Database   | SQLite (better-sqlite3, WAL mode)                             |
-| Browser    | Playwright (CDP, persistent context, storageState 영속화)     |
+| Browser    | Playwright (headless 수집, storageState로 세션 재사용)        |
 | Schedulers | macOS launchd · Claude App Routine                            |
 | AI 개발    | Claude Code — Custom Skills · Hooks · ADR 워크플로우          |
 
